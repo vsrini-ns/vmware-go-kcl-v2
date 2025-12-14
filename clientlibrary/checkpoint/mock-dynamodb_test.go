@@ -30,6 +30,7 @@ package checkpoint
 
 import (
 	"context"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -41,9 +42,13 @@ type mockDynamoDB struct {
 	item                      map[string]types.AttributeValue
 	conditionalExpression     string
 	expressionAttributeValues map[string]types.AttributeValue
+	scanFunc                  func(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error)
 }
 
 func (m *mockDynamoDB) Scan(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+	if m.scanFunc != nil {
+		return m.scanFunc(ctx, params, optFns...)
+	}
 	return &dynamodb.ScanOutput{}, nil
 }
 

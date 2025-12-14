@@ -372,8 +372,9 @@ func (checkpointer *DynamoCheckpoint) ListActiveWorkers(shardStatus map[string]*
 
 		leaseOwner := shard.GetLeaseOwner()
 		if leaseOwner == "" {
-			checkpointer.log.Debugf("Shard Not Assigned Error. ShardID: %s, WorkerID: %s", shard.ID, checkpointer.kclConfig.WorkerID)
-			return nil, ErrShardNotAssigned
+			checkpointer.log.Debugf("Shard Not Assigned. ShardID: %s, WorkerID: %s", shard.ID, checkpointer.kclConfig.WorkerID)
+			// Continue to build workers map for assigned shards instead of failing
+			continue
 		}
 
 		if w, ok := workers[leaseOwner]; ok {
@@ -456,7 +457,7 @@ func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.Sha
 
 	checkpointer.lastLeaseSync = time.Now()
 	input := &dynamodb.ScanInput{
-		ProjectionExpression: aws.String(fmt.Sprintf("%s,%s,%s", LeaseKeyKey, LeaseOwnerKey, SequenceNumberKey)),
+		ProjectionExpression: aws.String(fmt.Sprintf("%s,%s,%s,%s", LeaseKeyKey, LeaseOwnerKey, SequenceNumberKey, LeaseTimeoutKey)),
 		Select:               "SPECIFIC_ATTRIBUTES",
 		TableName:            aws.String(checkpointer.kclConfig.TableName),
 	}
@@ -480,6 +481,14 @@ func (checkpointer *DynamoCheckpoint) syncLeases(shardStatus map[string]*par.Sha
 		if shard, ok := shardStatus[shardId.(*types.AttributeValueMemberS).Value]; ok {
 			shard.SetLeaseOwner(assignedTo.(*types.AttributeValueMemberS).Value)
 			shard.SetCheckpoint(checkpoint.(*types.AttributeValueMemberS).Value)
+			// Parse and store LeaseTimeout if present
+			if leaseTimeout, foundLeaseTimeout := result[LeaseTimeoutKey]; foundLeaseTimeout {
+				if leaseTimeoutStr := leaseTimeout.(*types.AttributeValueMemberS).Value; leaseTimeoutStr != "" {
+					if parsedTimeout, err := time.Parse(time.RFC3339Nano, leaseTimeoutStr); err == nil {
+						shard.SetLeaseTimeout(parsedTimeout)
+					}
+				}
+			}
 		}
 	}
 
