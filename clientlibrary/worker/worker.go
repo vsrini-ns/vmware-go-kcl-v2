@@ -72,6 +72,8 @@ type Worker struct {
 
 	shardStatus          map[string]*par.ShardStatus
 	shardStealInProgress bool
+	activeConsumers      map[string]bool // Track shards with active consumer goroutines
+	consumersMux         sync.RWMutex    // Protects activeConsumers map
 }
 
 // NewWorker constructs a Worker instance for processing Kinesis stream data.
@@ -223,6 +225,7 @@ func (w *Worker) initialize() error {
 	}
 
 	w.shardStatus = make(map[string]*par.ShardStatus)
+	w.activeConsumers = make(map[string]bool)
 
 	stopChan := make(chan struct{})
 	w.stop = &stopChan
@@ -311,9 +314,19 @@ func (w *Worker) eventLoop() {
 			}
 		}
 
+		// Periodic orphan detection: check for expired leases and log warnings
+		w.detectOrphanedShards()
+
 		// max number of lease has not been reached yet
+		// Allow claiming multiple shards per cycle for faster orphan recovery
 		if counter < w.kclConfig.MaxLeasesForWorker {
+			shardsClaimed := 0
 			for _, shard := range w.shardStatus {
+				// Stop claiming if we've reached the limit
+				if counter+shardsClaimed >= w.kclConfig.MaxLeasesForWorker {
+					break
+				}
+
 				// already owner of the shard
 				if shard.GetLeaseOwner() == w.workerID {
 					continue
@@ -364,15 +377,22 @@ func (w *Worker) eventLoop() {
 
 				// log metrics on got lease
 				w.mService.LeaseGained(shard.ID)
+				shardsClaimed++
 				w.waitGroup.Add(1)
 				go func(shard *par.ShardStatus) {
 					defer w.waitGroup.Done()
+					// Track active consumer
+					w.markConsumerActive(shard.ID, true)
+					defer w.markConsumerActive(shard.ID, false)
 					if err := w.newShardConsumer(shard).getRecords(); err != nil {
 						log.Errorf("Error in getRecords: %+v", err)
 					}
 				}(shard)
-				// exit from for loop and not to grab more shard for now.
-				break
+				// Continue claiming shards until we reach MaxLeasesForWorker
+			}
+			if shardsClaimed > 0 {
+				log.Infof("Claimed %d shard(s) in this cycle. Current active leases: %d, Max: %d",
+					shardsClaimed, counter+shardsClaimed, w.kclConfig.MaxLeasesForWorker)
 			}
 		}
 
@@ -542,4 +562,56 @@ func (w *Worker) syncShard() error {
 	}
 
 	return nil
+}
+
+// detectOrphanedShards performs periodic orphan detection and logs warnings
+func (w *Worker) detectOrphanedShards() {
+	log := w.kclConfig.Logger
+	now := time.Now().UTC()
+	orphanCount := 0
+	var orphanedShards []string
+
+	for _, shard := range w.shardStatus {
+		// Skip completed shards
+		if shard.GetCheckpoint() == chk.ShardEnd {
+			continue
+		}
+
+		leaseOwner := shard.GetLeaseOwner()
+		leaseTimeout := shard.GetLeaseTimeout()
+
+		// Check for orphaned shards (expired lease with owner still set)
+		if leaseOwner != "" && !leaseTimeout.IsZero() && leaseTimeout.Before(now) {
+			orphanCount++
+			orphanedShards = append(orphanedShards, shard.ID)
+
+			// Check if this is a shard owned by current worker with no active consumer
+			if leaseOwner == w.workerID {
+				w.consumersMux.RLock()
+				hasActiveConsumer := w.activeConsumers[shard.ID]
+				w.consumersMux.RUnlock()
+
+				if !hasActiveConsumer {
+					log.Warnf("Lease renewal health check failed: ShardID: %s, LeaseTimeout expired: %s ago, No active consumer goroutine",
+						shard.ID, now.Sub(leaseTimeout))
+				}
+			}
+		}
+	}
+
+	if orphanCount > 0 {
+		log.Warnf("Detected %d orphaned shard(s) with expired leases: %v", orphanCount, orphanedShards)
+	}
+}
+
+// markConsumerActive tracks active consumer goroutines for health monitoring
+func (w *Worker) markConsumerActive(shardID string, active bool) {
+	w.consumersMux.Lock()
+	defer w.consumersMux.Unlock()
+
+	if active {
+		w.activeConsumers[shardID] = true
+	} else {
+		delete(w.activeConsumers, shardID)
+	}
 }

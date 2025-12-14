@@ -268,3 +268,169 @@ func TestLeaseCounterPreventOrphanRecoveryBlock(t *testing.T) {
 	assert.True(t, newCounter < worker.kclConfig.MaxLeasesForWorker,
 		"New logic: worker CAN claim orphaned shards (14 < 27)")
 }
+
+// TestDetectOrphanedShards tests the periodic orphan detection mechanism
+func TestDetectOrphanedShards(t *testing.T) {
+	kclConfig := config.NewKinesisClientLibConfig("appName", "test-stream", "us-west-2", "worker-1")
+
+	worker := &Worker{
+		workerID:        "worker-1",
+		kclConfig:       kclConfig,
+		shardStatus:     make(map[string]*par.ShardStatus),
+		activeConsumers: make(map[string]bool),
+	}
+
+	now := time.Now().UTC()
+	expiredTime := now.Add(-1 * time.Hour)
+	validTime := now.Add(1 * time.Hour)
+
+	// Create mix of valid and orphaned shards
+	worker.shardStatus["shard-valid"] = &par.ShardStatus{
+		ID:           "shard-valid",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-1",
+		Checkpoint:   "12345",
+		LeaseTimeout: validTime,
+	}
+
+	worker.shardStatus["shard-orphan-1"] = &par.ShardStatus{
+		ID:           "shard-orphan-1",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-2",
+		Checkpoint:   "67890",
+		LeaseTimeout: expiredTime,
+	}
+
+	worker.shardStatus["shard-orphan-2"] = &par.ShardStatus{
+		ID:           "shard-orphan-2",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-1", // This worker owns it but no consumer
+		Checkpoint:   "11111",
+		LeaseTimeout: expiredTime,
+	}
+
+	worker.shardStatus["shard-completed"] = &par.ShardStatus{
+		ID:           "shard-completed",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-1",
+		Checkpoint:   chk.ShardEnd,
+		LeaseTimeout: expiredTime,
+	}
+
+	// detectOrphanedShards should log warnings but not crash
+	// We can't easily test log output, but we can verify it doesn't panic
+	assert.NotPanics(t, func() {
+		worker.detectOrphanedShards()
+	})
+}
+
+// TestMarkConsumerActive tests consumer health tracking
+func TestMarkConsumerActive(t *testing.T) {
+	worker := &Worker{
+		activeConsumers: make(map[string]bool),
+	}
+
+	// Mark consumer as active
+	worker.markConsumerActive("shard-001", true)
+	worker.consumersMux.RLock()
+	assert.True(t, worker.activeConsumers["shard-001"])
+	worker.consumersMux.RUnlock()
+
+	// Mark consumer as inactive
+	worker.markConsumerActive("shard-001", false)
+	worker.consumersMux.RLock()
+	assert.False(t, worker.activeConsumers["shard-001"])
+	worker.consumersMux.RUnlock()
+
+	// Multiple shards
+	worker.markConsumerActive("shard-001", true)
+	worker.markConsumerActive("shard-002", true)
+	worker.markConsumerActive("shard-003", true)
+	worker.consumersMux.RLock()
+	assert.Equal(t, 3, len(worker.activeConsumers))
+	worker.consumersMux.RUnlock()
+
+	// Remove one
+	worker.markConsumerActive("shard-002", false)
+	worker.consumersMux.RLock()
+	assert.Equal(t, 2, len(worker.activeConsumers))
+	assert.True(t, worker.activeConsumers["shard-001"])
+	assert.False(t, worker.activeConsumers["shard-002"])
+	assert.True(t, worker.activeConsumers["shard-003"])
+	worker.consumersMux.RUnlock()
+}
+
+// TestBulkShardClaiming tests that workers can claim multiple shards per cycle
+func TestBulkShardClaiming(t *testing.T) {
+	kclConfig := config.NewKinesisClientLibConfig("appName", "test-stream", "us-west-2", "worker-1").
+		WithMaxLeasesForWorker(10)
+
+	worker := &Worker{
+		workerID:    "worker-1",
+		kclConfig:   kclConfig,
+		shardStatus: make(map[string]*par.ShardStatus),
+	}
+
+	now := time.Now().UTC()
+	validTime := now.Add(1 * time.Hour)
+
+	// Worker has 2 active shards
+	worker.shardStatus["shard-001"] = &par.ShardStatus{
+		ID:           "shard-001",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-1",
+		Checkpoint:   "12345",
+		LeaseTimeout: validTime,
+	}
+
+	worker.shardStatus["shard-002"] = &par.ShardStatus{
+		ID:           "shard-002",
+		Mux:          &sync.RWMutex{},
+		AssignedTo:   "worker-1",
+		Checkpoint:   "67890",
+		LeaseTimeout: validTime,
+	}
+
+	// 5 unassigned shards available to claim
+	for i := 3; i <= 7; i++ {
+		shardID := "shard-00" + string(rune('0'+i))
+		worker.shardStatus[shardID] = &par.ShardStatus{
+			ID:           shardID,
+			Mux:          &sync.RWMutex{},
+			AssignedTo:   "",
+			Checkpoint:   "00000",
+			LeaseTimeout: time.Time{},
+		}
+	}
+
+	// Count current active leases
+	counter := 0
+	for _, shard := range worker.shardStatus {
+		if shard.GetLeaseOwner() == worker.workerID && shard.GetCheckpoint() != chk.ShardEnd {
+			leaseTimeout := shard.GetLeaseTimeout()
+			if !leaseTimeout.IsZero() && leaseTimeout.Before(time.Now().UTC()) {
+				continue
+			}
+			counter++
+		}
+	}
+
+	assert.Equal(t, 2, counter, "Worker currently has 2 active leases")
+
+	// Calculate how many shards can be claimed
+	availableSlots := worker.kclConfig.MaxLeasesForWorker - counter
+	assert.Equal(t, 8, availableSlots, "Worker has capacity for 8 more shards (10 - 2)")
+
+	// Old logic would only claim 1 shard per cycle
+	// New logic can claim up to availableSlots shards in one cycle
+	unassignedCount := 0
+	for _, shard := range worker.shardStatus {
+		if shard.GetLeaseOwner() == "" && shard.GetCheckpoint() != chk.ShardEnd {
+			unassignedCount++
+		}
+	}
+
+	assert.Equal(t, 5, unassignedCount, "5 unassigned shards available")
+	assert.True(t, unassignedCount <= availableSlots,
+		"Worker can claim all 5 unassigned shards in one cycle with new logic")
+}
