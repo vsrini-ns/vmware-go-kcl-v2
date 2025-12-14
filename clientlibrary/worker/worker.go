@@ -297,9 +297,16 @@ func (w *Worker) eventLoop() {
 		}
 
 		// Count the number of leases held by this worker excluding the processed shard
+		// Only count leases that are not expired to allow reclaiming orphaned shards
 		counter := 0
 		for _, shard := range w.shardStatus {
 			if shard.GetLeaseOwner() == w.workerID && shard.GetCheckpoint() != chk.ShardEnd {
+				// Exclude expired leases from the count
+				leaseTimeout := shard.GetLeaseTimeout()
+				if !leaseTimeout.IsZero() && leaseTimeout.Before(time.Now().UTC()) {
+					log.Debugf("Excluding expired lease from counter. ShardID: %s, LeaseTimeout: %s", shard.ID, leaseTimeout)
+					continue
+				}
 				counter++
 			}
 		}

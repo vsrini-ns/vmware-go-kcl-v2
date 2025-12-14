@@ -417,9 +417,17 @@ func TestListActiveWorkersErrShardNotAssigned(t *testing.T) {
 		"0000": {ID: "0000", Mux: &sync.RWMutex{}},
 	}
 
-	_, err = checkpoint.ListActiveWorkers(shardStatus)
-	if err != ErrShardNotAssigned {
-		t.Error("Expected ErrShardNotAssigned when shard is missing AssignedTo value")
+	// After the fix, ListActiveWorkers should NOT return error for unassigned shards
+	// It should return an empty workers map instead
+	workers, err := checkpoint.ListActiveWorkers(shardStatus)
+	if err != nil {
+		t.Errorf("Expected no error, but got: %+v", err)
+	}
+	if workers == nil {
+		t.Error("Expected non-nil workers map")
+	}
+	if len(workers) != 0 {
+		t.Errorf("Expected empty workers map for unassigned shard, got: %+v", workers)
 	}
 }
 
@@ -484,4 +492,227 @@ func TestClaimShard(t *testing.T) {
 	assert.Equal(t, shard.AssignedTo, status.AssignedTo)
 	assert.Equal(t, shard.Checkpoint, status.Checkpoint)
 	assert.Equal(t, shard.ParentShardId, status.ParentShardId)
+}
+
+// TestSyncLeasesWithLeaseTimeout tests that syncLeases properly fetches and parses LeaseTimeout
+func TestSyncLeasesWithLeaseTimeout(t *testing.T) {
+	kclConfig := cfg.NewKinesisClientLibConfig("appName", "test", "us-west-2", "workerID").
+		WithInitialPositionInStream(cfg.LATEST).
+		WithMaxLeasesForWorker(1)
+
+	expiredTimeout := time.Now().UTC().Add(-1 * time.Hour)
+	validTimeout := time.Now().UTC().Add(1 * time.Hour)
+
+	mockSvc := &mockDynamoDB{
+		tableExist: true,
+		item:       map[string]types.AttributeValue{},
+	}
+
+	// Mock Scan to return shards with LeaseTimeout values
+	mockSvc.scanFunc = func(ctx context.Context, params *dynamodb.ScanInput, optFns ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+		return &dynamodb.ScanOutput{
+			Items: []map[string]types.AttributeValue{
+				{
+					LeaseKeyKey:       &types.AttributeValueMemberS{Value: "shard-0001"},
+					LeaseOwnerKey:     &types.AttributeValueMemberS{Value: "worker-1"},
+					SequenceNumberKey: &types.AttributeValueMemberS{Value: "12345"},
+					LeaseTimeoutKey:   &types.AttributeValueMemberS{Value: validTimeout.Format(time.RFC3339Nano)},
+				},
+				{
+					LeaseKeyKey:       &types.AttributeValueMemberS{Value: "shard-0002"},
+					LeaseOwnerKey:     &types.AttributeValueMemberS{Value: "worker-1"},
+					SequenceNumberKey: &types.AttributeValueMemberS{Value: "67890"},
+					LeaseTimeoutKey:   &types.AttributeValueMemberS{Value: expiredTimeout.Format(time.RFC3339Nano)},
+				},
+				{
+					LeaseKeyKey:       &types.AttributeValueMemberS{Value: "shard-0003"},
+					LeaseOwnerKey:     &types.AttributeValueMemberS{Value: "worker-2"},
+					SequenceNumberKey: &types.AttributeValueMemberS{Value: "11111"},
+					// No LeaseTimeout - should still work
+				},
+			},
+		}, nil
+	}
+
+	checkpoint := NewDynamoCheckpoint(kclConfig).WithDynamoDB(mockSvc)
+
+	shardStatus := map[string]*par.ShardStatus{
+		"shard-0001": {ID: "shard-0001", Mux: &sync.RWMutex{}},
+		"shard-0002": {ID: "shard-0002", Mux: &sync.RWMutex{}},
+		"shard-0003": {ID: "shard-0003", Mux: &sync.RWMutex{}},
+	}
+
+	err := checkpoint.syncLeases(shardStatus)
+	assert.NoError(t, err)
+
+	// Verify shard-0001 has valid timeout
+	assert.Equal(t, "worker-1", shardStatus["shard-0001"].GetLeaseOwner())
+	assert.Equal(t, "12345", shardStatus["shard-0001"].GetCheckpoint())
+	assert.False(t, shardStatus["shard-0001"].GetLeaseTimeout().IsZero())
+	assert.True(t, shardStatus["shard-0001"].GetLeaseTimeout().After(time.Now().UTC()))
+
+	// Verify shard-0002 has expired timeout
+	assert.Equal(t, "worker-1", shardStatus["shard-0002"].GetLeaseOwner())
+	assert.Equal(t, "67890", shardStatus["shard-0002"].GetCheckpoint())
+	assert.False(t, shardStatus["shard-0002"].GetLeaseTimeout().IsZero())
+	assert.True(t, shardStatus["shard-0002"].GetLeaseTimeout().Before(time.Now().UTC()))
+
+	// Verify shard-0003 works without LeaseTimeout
+	assert.Equal(t, "worker-2", shardStatus["shard-0003"].GetLeaseOwner())
+	assert.Equal(t, "11111", shardStatus["shard-0003"].GetCheckpoint())
+}
+
+// TestListActiveWorkersWithUnassignedShards tests that ListActiveWorkers continues on unassigned shards
+func TestListActiveWorkersWithUnassignedShards(t *testing.T) {
+	kclConfig := cfg.NewKinesisClientLibConfig("appName", "test", "us-west-2", "workerID").
+		WithInitialPositionInStream(cfg.LATEST)
+
+	mockSvc := &mockDynamoDB{
+		tableExist: true,
+		item:       map[string]types.AttributeValue{},
+	}
+
+	checkpoint := NewDynamoCheckpoint(kclConfig).WithDynamoDB(mockSvc)
+	// Force lastLeaseSync to past so syncLeases doesn't skip
+	checkpoint.lastLeaseSync = time.Now().Add(-2 * time.Minute)
+
+	shardStatus := map[string]*par.ShardStatus{
+		"shard-0001": {
+			ID:         "shard-0001",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-1",
+			Checkpoint: "12345",
+		},
+		"shard-0002": {
+			ID:         "shard-0002",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "", // Unassigned shard
+			Checkpoint: "67890",
+		},
+		"shard-0003": {
+			ID:         "shard-0003",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-2",
+			Checkpoint: "11111",
+		},
+		"shard-0004": {
+			ID:         "shard-0004",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-1",
+			Checkpoint: "22222",
+		},
+		"shard-0005": {
+			ID:         "shard-0005",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "", // Another unassigned shard
+			Checkpoint: "33333",
+		},
+	}
+
+	// Should not return error, should return partial workers map
+	workers, err := checkpoint.ListActiveWorkers(shardStatus)
+	assert.NoError(t, err)
+	assert.NotNil(t, workers)
+
+	// Should have 2 workers
+	assert.Equal(t, 2, len(workers))
+
+	// worker-1 should have 2 shards
+	assert.Equal(t, 2, len(workers["worker-1"]))
+	assert.Contains(t, []string{workers["worker-1"][0].ID, workers["worker-1"][1].ID}, "shard-0001")
+	assert.Contains(t, []string{workers["worker-1"][0].ID, workers["worker-1"][1].ID}, "shard-0004")
+
+	// worker-2 should have 1 shard
+	assert.Equal(t, 1, len(workers["worker-2"]))
+	assert.Equal(t, "shard-0003", workers["worker-2"][0].ID)
+
+	// Unassigned shards should not be in workers map
+	for _, shards := range workers {
+		for _, shard := range shards {
+			assert.NotEqual(t, "shard-0002", shard.ID)
+			assert.NotEqual(t, "shard-0005", shard.ID)
+		}
+	}
+}
+
+// TestListActiveWorkersWithAllUnassigned tests edge case where all shards are unassigned
+func TestListActiveWorkersWithAllUnassigned(t *testing.T) {
+	kclConfig := cfg.NewKinesisClientLibConfig("appName", "test", "us-west-2", "workerID").
+		WithInitialPositionInStream(cfg.LATEST)
+
+	mockSvc := &mockDynamoDB{
+		tableExist: true,
+		item:       map[string]types.AttributeValue{},
+	}
+
+	checkpoint := NewDynamoCheckpoint(kclConfig).WithDynamoDB(mockSvc)
+	checkpoint.lastLeaseSync = time.Now().Add(-2 * time.Minute)
+
+	shardStatus := map[string]*par.ShardStatus{
+		"shard-0001": {
+			ID:         "shard-0001",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "", // Unassigned
+			Checkpoint: "12345",
+		},
+		"shard-0002": {
+			ID:         "shard-0002",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "", // Unassigned
+			Checkpoint: "67890",
+		},
+	}
+
+	// Should not return error, should return empty workers map
+	workers, err := checkpoint.ListActiveWorkers(shardStatus)
+	assert.NoError(t, err)
+	assert.NotNil(t, workers)
+	assert.Equal(t, 0, len(workers))
+}
+
+// TestListActiveWorkersSkipsShardEnd tests that completed shards are excluded
+func TestListActiveWorkersSkipsShardEnd(t *testing.T) {
+	kclConfig := cfg.NewKinesisClientLibConfig("appName", "test", "us-west-2", "workerID").
+		WithInitialPositionInStream(cfg.LATEST)
+
+	mockSvc := &mockDynamoDB{
+		tableExist: true,
+		item:       map[string]types.AttributeValue{},
+	}
+
+	checkpoint := NewDynamoCheckpoint(kclConfig).WithDynamoDB(mockSvc)
+	checkpoint.lastLeaseSync = time.Now().Add(-2 * time.Minute)
+
+	shardStatus := map[string]*par.ShardStatus{
+		"shard-0001": {
+			ID:         "shard-0001",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-1",
+			Checkpoint: "12345",
+		},
+		"shard-0002": {
+			ID:         "shard-0002",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-1",
+			Checkpoint: ShardEnd, // Completed shard
+		},
+		"shard-0003": {
+			ID:         "shard-0003",
+			Mux:        &sync.RWMutex{},
+			AssignedTo: "worker-2",
+			Checkpoint: "11111",
+		},
+	}
+
+	workers, err := checkpoint.ListActiveWorkers(shardStatus)
+	assert.NoError(t, err)
+	assert.NotNil(t, workers)
+
+	// worker-1 should have 1 shard (not the ShardEnd one)
+	assert.Equal(t, 1, len(workers["worker-1"]))
+	assert.Equal(t, "shard-0001", workers["worker-1"][0].ID)
+
+	// worker-2 should have 1 shard
+	assert.Equal(t, 1, len(workers["worker-2"]))
+	assert.Equal(t, "shard-0003", workers["worker-2"][0].ID)
 }
